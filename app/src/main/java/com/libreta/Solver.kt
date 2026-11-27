@@ -1,25 +1,131 @@
 package com.libreta
 
 import kotlinx.coroutines.suspendCancellableCoroutine
-import okhttp3.*
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
-import java.net.*
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-class UnsolvableException(message:String):Exception(message)
+/** El modelo declaró que no puede resolver el ejercicio con certeza. */
+class UnsolvableException(message: String) : Exception(message)
+
 object Solver {
-    private val http=OkHttpClient.Builder().callTimeout(60,TimeUnit.SECONDS).build()
-    private val types=setOf("datos","planteo","operacion","procedimiento","resultado","otro")
-    private val solvePrompt="""Resuelve el ejercicio en español en pasos ordenados y breves. Responde SOLO JSON: {"resoluble":true,"motivo":"","pasos":[{"tipo":"datos|planteo|operacion|procedimiento|resultado|otro","copiar":"...","aclaracion":"..."}]}. Entre 3 y 8 pasos. copiar contiene únicamente lo que se anota; aclaracion explica en una frase. Verifica el resultado. Si falta información o hay ambigüedad, responde resoluble:false y no inventes."""
-    private val simplifyPrompt="""Simplifica la explicación sin alterar el contenido que se copia. SOLO JSON: {"aclaracion":"..."} (máximo dos frases)."""
-    suspend fun solve(raw:String,normalized:String):List<ExerciseStep>{val o=parseObject(call(solvePrompt,"Dictado original: $raw\nNormalizado: $normalized"));if(!o.optBoolean("resoluble",true))throw UnsolvableException(o.optString("motivo").ifBlank{"No pude resolver este ejercicio."});val arr=o.optJSONArray("pasos")?:throw UnsolvableException("La respuesta no incluyó pasos.");val out=mutableListOf<ExerciseStep>();for(i in 0 until arr.length()){val p=arr.optJSONObject(i)?:continue;val copiar=p.optString("copiar").trim();if(copiar.isBlank())continue;val tipo=p.optString("tipo").lowercase().takeIf{it in types}?:"otro";out+=ExerciseStep(tipo,copiar,p.optString("aclaracion").trim())};if(out.size !in 3..12)throw UnsolvableException("No obtuve pasos válidos. Intenta dictarlo de nuevo.");return out}
-    suspend fun simplify(exercise:String,step:ExerciseStep):String{val o=parseObject(call(simplifyPrompt,"Ejercicio: $exercise\nPaso: ${step.copiar}\nAclaración: ${step.aclaracion}"));return o.optString("aclaracion").trim().ifBlank{throw IOException("Respuesta de simplificación vacía")}}
-    private fun parseObject(text:String):JSONObject{val start=text.indexOf('{');if(start<0)throw IOException("Respuesta JSON no válida");var depth=0;var quoted=false;var escaped=false;for(i in start until text.length){val c=text[i];if(quoted){if(escaped)escaped=false else if(c=='\\')escaped=true else if(c=='"')quoted=false}else when(c){'"'->quoted=true;'{'=>depth++;'}'->{depth--;if(depth==0)return try{JSONObject(text.substring(start,i+1))}catch(e:Exception){throw IOException("JSON del modelo no válido",e)}}}};throw IOException("JSON del modelo incompleto")}
-    private suspend fun call(system:String,user:String):String=suspendCancellableCoroutine{cont->if(BuildConfig.ANTHROPIC_KEY.isBlank()){cont.resumeWithException(IOException("Falta ANTHROPIC_KEY en local.properties"));return@suspendCancellableCoroutine};val body=JSONObject().put("model",BuildConfig.ANTHROPIC_MODEL).put("max_tokens",1500).put("system",system).put("messages",JSONArray().put(JSONObject().put("role","user").put("content",user)));val req=Request.Builder().url("https://api.anthropic.com/v1/messages").header("x-api-key",BuildConfig.ANTHROPIC_KEY).header("anthropic-version","2023-06-01").header("content-type","application/json").post(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType())).build();val call=http.newCall(req);cont.invokeOnCancellation{call.cancel()};call.enqueue(object:Callback{override fun onFailure(call:Call,e:IOException){if(cont.isActive)cont.resumeWithException(IOException(when(e){is UnknownHostException,is ConnectException,is SocketTimeoutException->"Sin conexión o tiempo agotado.";else->e.message?:"Error de red"},e))};override fun onResponse(call:Call,response:Response){response.use{r->try{val raw=r.body?.string().orEmpty();if(!r.isSuccessful){val msg=try{JSONObject(raw).getJSONObject("error").optString("message")}catch(_:Exception){""};throw IOException(when(r.code){401->"Clave de API inválida.";429->"Límite de peticiones alcanzado.";else->msg.ifBlank{"Error del servicio (${r.code})."}})};val content=JSONObject(raw).optJSONArray("content")?:throw IOException("Respuesta de API incompleta");val text=buildString{for(i in 0 until content.length()){val b=content.optJSONObject(i);if(b?.optString("type")=="text")append(b.optString("text"))}};if(cont.isActive)cont.resume(text)}catch(e:Exception){if(cont.isActive)cont.resumeWithException(if(e is IOException)e else IOException("Respuesta del servicio no válida",e))}}}})}
+    private const val MODEL = "claude-sonnet-5-5"
+    private val http = OkHttpClient.Builder().callTimeout(60, TimeUnit.SECONDS).build()
+    private val TIPOS = setOf("datos", "planteo", "operacion", "procedimiento", "resultado", "otro")
+
+    private val SOLVE_PROMPT = """
+Eres un compañero que dicta qué anotar en una libreta. Resuelve el ejercicio en pasos cortos y ordenados
+(Datos, Planteo/Fórmula, Sustitución, Desarrollo, Resultado cuando aplique; adapta el orden si es lógica, programación o texto).
+Responde SOLO un JSON, sin markdown ni texto extra:
+{"resoluble":true,"motivo":"","pasos":[{"tipo":"datos|planteo|operacion|procedimiento|resultado|otro","copiar":"...","aclaracion":"..."}]}
+Reglas:
+- Entre 3 y 8 pasos.
+- "copiar": lo exacto y breve que se escribe a mano, en texto plano (usa ^, /, √). Solo operaciones o procedimiento, sin explicaciones.
+- "aclaracion": la explicación, máximo una frase, tono natural. Nada de esto va en "copiar".
+- Comprueba el resultado final antes de responder.
+- El enunciado viene de dictado por voz y puede tener errores. Si es incompleto, ambiguo o no puedes resolverlo con certeza,
+  responde {"resoluble":false,"motivo":"<qué falta, en una frase>","pasos":[]}. Nunca inventes datos ni resultados.
+""".trimIndent()
+
+    private val SIMPLIFY_PROMPT = """
+Reexplica de forma más simple y con palabras cotidianas la aclaración de un paso de un ejercicio.
+No cambies lo que se copia. Responde SOLO JSON: {"aclaracion":"..."} (máximo 2 frases).
+""".trimIndent()
+
+    suspend fun solve(raw: String, normalized: String): List<ExerciseStep> {
+        val o = JSONObject(extractJson(call(SOLVE_PROMPT, "Dictado original: $raw\nNormalizado: $normalized")))
+        if (!o.optBoolean("resoluble", true))
+            throw UnsolvableException(o.optString("motivo").ifBlank { "No pude resolver este ejercicio." })
+        val arr = o.optJSONArray("pasos") ?: JSONArray()
+        val steps = (0 until arr.length()).mapNotNull { i ->
+            val p = arr.optJSONObject(i) ?: return@mapNotNull null
+            val copiar = p.optString("copiar").trim()
+            if (copiar.isEmpty()) null
+            else ExerciseStep(
+                tipo = p.optString("tipo").lowercase().takeIf { it in TIPOS } ?: "otro",
+                copiar = copiar,
+                aclaracion = p.optString("aclaracion").trim()
+            )
+        }.take(12)
+        if (steps.isEmpty()) throw UnsolvableException("No obtuve pasos válidos. Intenta dictarlo de nuevo.")
+        return steps
+    }
+
+    suspend fun simplify(exercise: String, step: ExerciseStep): String {
+        val user = "Ejercicio: $exercise\nPaso (se copia): ${step.copiar}\nAclaración actual: ${step.aclaracion}"
+        val o = JSONObject(extractJson(call(SIMPLIFY_PROMPT, user)))
+        return o.optString("aclaracion").trim().ifEmpty { throw IOException("Respuesta vacía del modelo") }
+    }
+
+    private fun extractJson(s: String): String {
+        val a = s.indexOf('{')
+        val b = s.lastIndexOf('}')
+        if (a < 0 || b < a) throw IOException("Respuesta del modelo no válida")
+        return s.substring(a, b + 1)
+    }
+
+    /** Llamada cancelable: si la corrutina se cancela, se cancela también la petición HTTP. */
+    private suspend fun call(system: String, user: String): String = suspendCancellableCoroutine { cont ->
+        if (BuildConfig.ANTHROPIC_KEY.isBlank()) {
+            cont.resumeWithException(IOException("Falta ANTHROPIC_KEY en local.properties"))
+            return@suspendCancellableCoroutine
+        }
+        val body = JSONObject()
+            .put("model", MODEL).put("max_tokens", 1500).put("system", system)
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", user)))
+        val req = Request.Builder().url("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", BuildConfig.ANTHROPIC_KEY)   // MVP: en producción, proxy propio
+            .header("anthropic-version", "2023-06-01")
+            .post(body.toString().toRequestBody("application/json".toMediaType())).build()
+        val c = http.newCall(req)
+        cont.invokeOnCancellation { c.cancel() }
+        c.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                val msg = when (e) {
+                    is UnknownHostException, is ConnectException, is SocketTimeoutException -> "Sin conexión o tiempo agotado."
+                    else -> e.message ?: "Error de red"
+                }
+                if (cont.isActive) cont.resumeWithException(IOException(msg))
+            }
+            override fun onResponse(call: Call, response: Response) {
+                try {
+                    val text = response.use { parse(it) }
+                    if (cont.isActive) cont.resume(text)
+                } catch (e: Exception) {
+                    if (cont.isActive) cont.resumeWithException(IOException(e.message ?: "Respuesta no válida"))
+                }
+            }
+        })
+    }
+
+    private fun parse(r: Response): String {
+        val txt = r.body?.string().orEmpty()
+        if (!r.isSuccessful) throw IOException(
+            when (r.code) {
+                401 -> "Clave de API inválida."
+                429 -> "Límite de peticiones alcanzado. Espera un momento."
+                else -> "Error del servicio (${r.code})."
+            }
+        )
+        val content = JSONObject(txt).getJSONArray("content")
+        val sb = StringBuilder()
+        for (i in 0 until content.length()) {
+            val blk = content.getJSONObject(i)
+            if (blk.optString("type") == "text") sb.append(blk.optString("text"))
+        }
+        return sb.toString()
+    }
 }
