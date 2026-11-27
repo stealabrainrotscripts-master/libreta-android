@@ -5,26 +5,201 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.speech.*
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 
-class VoiceController(context:Context){
-    private val ctx=context.applicationContext;private val main=Handler(Looper.getMainLooper());private var recognizer:SpeechRecognizer?=null;private var wake:PorcupineWake?=null;private var wakeKeyword:String?=null;private var active=false;private var capturing=false;private var session=0;private var errors=0;private val buf=StringBuilder()
-    private val speechIntent=Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,RecognizerIntent.LANGUAGE_MODEL_FREE_FORM).putExtra(RecognizerIntent.EXTRA_LANGUAGE,"es-ES").putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS,true).putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE,true).putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,2200L)
-    private val startTask=Runnable{if(active&&needsRecognizer){try{recognizer?.startListening(speechIntent)}catch(_:RuntimeException){schedule(500)}}};private val timeout=Runnable{if(capturing)finish(session)};private val needsRecognizer get()=capturing||wake==null
-    fun start(){if(active)return;if(!SpeechRecognizer.isRecognitionAvailable(ctx)){Controller.setError("Este dispositivo no tiene reconocimiento de voz");return};active=true;errors=0;recognizer=SpeechRecognizer.createSpeechRecognizer(ctx).also{it.setRecognitionListener(listener)};prepareWake();waiting()}
-    fun stop(){active=false;capturing=false;session++;buf.clear();main.removeCallbacksAndMessages(null);try{wake?.stop()}catch(_:Exception){};try{recognizer?.cancel();recognizer?.destroy()}catch(_:Exception){};recognizer=null;Controller.setMic(Mic.OFF);Controller.setPartial("")}
-    fun release(){stop();wake?.release();wake=null;wakeKeyword=null}
-    fun reconfigure(){if(!active)return;main.removeCallbacksAndMessages(null);session++;capturing=false;buf.clear();wake?.stop();prepareWake();waiting()}
-    fun trigger(){if(active&&!capturing){wake?.stop();beginCapture()}}
-    private fun prepareWake(){val kw=Controller.state.value.keyword;if(wake!=null&&wakeKeyword==kw)return;wake?.release();wake=PorcupineWake.create(ctx,kw){main.post{if(active)onWake()}};wakeKeyword=kw;Controller.setWakeMode(if(wake==null)WakeMode.TEXT else WakeMode.PORCUPINE)}
-    private fun waiting(){capturing=false;buf.clear();main.removeCallbacks(timeout);main.removeCallbacks(startTask);Controller.setMic(Mic.WAITING);Controller.setPartial("");try{recognizer?.cancel()}catch(_:Exception){};val w=wake;if(w==null)schedule(150)else if(!w.start()){w.release();wake=null;wakeKeyword=null;Controller.setWakeMode(WakeMode.TEXT);Controller.setError("Porcupine no arrancó; uso reconocimiento por texto");schedule(150)}}
-    private fun onWake(){if(!active||capturing)return;wake?.stop();beginCapture()}
-    private fun beginCapture(){capturing=true;session++;buf.clear();Controller.setMic(Mic.LISTENING);main.removeCallbacks(timeout);main.postDelayed(timeout,45_000);schedule(250)}
-    private fun schedule(delay:Long){main.removeCallbacks(startTask);if(active&&needsRecognizer)main.postDelayed(startTask,delay)}
-    private fun add(text:String){val piece=Normalizer.dropLeadingKeyword(text,Controller.state.value.keyword).trim();if(piece.isNotEmpty())buf.append(' ').append(piece)}
-    private fun finish(expected:Int){if(!active||!capturing||expected!=session)return;val text=buf.toString().trim();waiting();if(text.isNotBlank())Controller.submit(text)}
-    private fun waitingText(text:String){val normalized=Normalizer.plain(text);val kw=Normalizer.plain(Controller.state.value.keyword);val index=if(kw.isBlank())-1 else Regex("(?<![\\p{L}\\d])${Regex.escape(kw)}(?![\\p{L}\\d])").find(normalized)?.range?.first?:-1;if(index<0)return;capturing=true;session++;buf.clear();Controller.setMic(Mic.LISTENING);main.postDelayed(timeout,45_000);add(normalized.substring(index+kw.length));if(buf.isNotBlank())finish(session)}
-    private fun first(b:Bundle?)=b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty().lowercase().trim()
-    private fun listenerError(e:Int){when(e){SpeechRecognizer.ERROR_NO_MATCH,SpeechRecognizer.ERROR_SPEECH_TIMEOUT->{if(capturing)finish(session)else schedule(200)};SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS->{Controller.setPermissionDenied(true);stop()};SpeechRecognizer.ERROR_RECOGNIZER_BUSY,SpeechRecognizer.ERROR_CLIENT->schedule(500);else->{Controller.setError("Reconocimiento de voz: código $e");if(++errors>=6){stop();Controller.setError("Reconocimiento de voz no disponible (código $e)")}else schedule(1200)}}}
-    private val listener=object:RecognitionListener{override fun onReadyForSpeech(params:Bundle?){errors=0};override fun onBeginningOfSpeech(){};override fun onRmsChanged(rmsdB:Float){};override fun onBufferReceived(buffer:ByteArray?){};override fun onEndOfSpeech(){};override fun onError(error:Int){listenerError(error)};override fun onResults(results:Bundle?){errors=0;val text=first(results);if(capturing){add(text);finish(session)}else if(wake==null&&text.isNotBlank())waitingText(text);if(active&&needsRecognizer)schedule(150)};override fun onPartialResults(partialResults:Bundle?){val text=first(partialResults);if(text.isBlank())return;if(capturing){Controller.setPartial(text);if(Normalizer.closes(text))try{recognizer?.stopListening()}catch(_:Exception){}}};override fun onEvent(eventType:Int,params:Bundle?) {}}
+/**
+ * Dos fases separadas:
+ *  ESPERA  -> Porcupine (local, ligero). Sin Porcupine configurado: modo texto, que repite SpeechRecognizer
+ *             en bucle y busca la palabra clave en lo transcrito (funciona, pero gasta más batería).
+ *  CAPTURA -> SpeechRecognizer una sola vez: termina con "listo", con una pausa o a los 45 s.
+ * Los comandos solo se interpretan al terminar la captura (Controller.submit), nunca durante el dictado.
+ * Solo vive con la Activity visible: start() en onResume, stop() en onPause, release() en onDestroy.
+ * Todo corre en el hilo principal.
+ */
+class VoiceController(private val ctx: Context) {
+    private val main = Handler(Looper.getMainLooper())
+    private var rec: SpeechRecognizer? = null
+    private var wake: PorcupineWake? = null
+    private var wakeKeyword: String? = null
+    private var active = false
+    private var capturing = false
+    private var errors = 0
+    private val buf = StringBuilder()
+
+    private val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+        .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
+        .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+        .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        .putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L)
+
+    private val listenRunnable = Runnable { if (active) { rec?.cancel(); rec?.startListening(intent) } }
+    private val watchdog = Runnable { if (capturing) finish() }
+    private val needsRecognizer: Boolean get() = capturing || wake == null
+
+    fun start() {
+        if (active) return
+        if (!SpeechRecognizer.isRecognitionAvailable(ctx)) {
+            Controller.setError("Este dispositivo no tiene reconocimiento de voz"); return
+        }
+        active = true; errors = 0
+        Controller.setError(null)
+        rec = SpeechRecognizer.createSpeechRecognizer(ctx).also { it.setRecognitionListener(listener) }
+        prepareWake()
+        waiting()
+    }
+
+    fun stop() {
+        active = false; capturing = false; buf.clear()
+        main.removeCallbacksAndMessages(null)
+        wake?.stop()
+        rec?.destroy(); rec = null
+        Controller.setMic(Mic.OFF); Controller.setPartial("")
+    }
+
+    fun release() { stop(); wake?.release(); wake = null; wakeKeyword = null }
+
+    /** Cambió la palabra clave: reconstruye el detector. */
+    fun reconfigure() {
+        if (!active) return
+        main.removeCallbacksAndMessages(null)
+        capturing = false; buf.clear()
+        wake?.stop(); rec?.cancel()
+        prepareWake()
+        waiting()
+    }
+
+    /** Disparo manual (tocar el indicador) por si la palabra clave falla. */
+    fun trigger() {
+        if (!active || capturing) return
+        wake?.stop()
+        beginCapture(200)
+    }
+
+    private fun prepareWake() {
+        val kw = Controller.state.value.keyword
+        if (wake != null && wakeKeyword == kw) return
+        wake?.release()
+        wake = PorcupineWake.create(ctx, kw) { main.post { onWake() } }
+        wakeKeyword = kw
+        Controller.setWakeMode(if (wake != null) WakeMode.PORCUPINE else WakeMode.TEXT)
+    }
+
+    private fun waiting() {
+        capturing = false; buf.clear()
+        main.removeCallbacks(watchdog); main.removeCallbacks(listenRunnable)
+        Controller.setMic(Mic.WAITING); Controller.setPartial("")
+        rec?.cancel()
+        val w = wake
+        if (w == null) listen()
+        else if (!w.start()) {
+            w.release(); wake = null; wakeKeyword = null
+            Controller.setWakeMode(WakeMode.TEXT)
+            Controller.setError("Porcupine no arrancó; uso el modo texto (más batería)")
+            listen()
+        }
+    }
+
+    private fun onWake() {
+        if (!active || capturing) return
+        wake?.stop()                // libera el micrófono antes de abrir SpeechRecognizer
+        beginCapture(200)
+    }
+
+    private fun beginCapture(delay: Long) {
+        capturing = true; buf.clear()
+        Controller.setMic(Mic.LISTENING)
+        main.removeCallbacks(watchdog); main.postDelayed(watchdog, 45_000)
+        listen(delay)
+    }
+
+    private fun listen(delay: Long = 0) {
+        main.removeCallbacks(listenRunnable)     // evita sesiones duplicadas
+        main.postDelayed(listenRunnable, delay)
+    }
+
+    private fun add(s: String) {
+        val piece = Normalizer.dropLeadingKeyword(s, Controller.state.value.keyword).trim()
+        if (piece.isNotEmpty()) buf.append(' ').append(piece)
+    }
+
+    private fun finish() {
+        val text = buf.toString().trim()
+        waiting()
+        if (text.isNotBlank()) Controller.submit(text)
+    }
+
+    /** Solo modo texto: busca la palabra clave en lo transcrito; todo lo demás se descarta sin guardarse. */
+    private fun waitingText(t: String) {
+        val plain = Normalizer.plain(t)
+        val kw = Normalizer.plain(Controller.state.value.keyword)
+        val i = if (kw.isEmpty()) -1 else plain.indexOf(kw)
+        if (i < 0) return
+        capturing = true; buf.clear()
+        Controller.setMic(Mic.LISTENING)
+        main.removeCallbacks(watchdog); main.postDelayed(watchdog, 45_000)
+        add(plain.substring(i + kw.length))
+        if (buf.isNotBlank()) finish()           // palabra clave + ejercicio en la misma frase
+    }
+
+    private fun first(b: Bundle?) =
+        b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty().lowercase().trim()
+
+    private fun describe(e: Int) = when (e) {
+        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT, SpeechRecognizer.ERROR_SERVER ->
+            "sin red: descarga el paquete de voz offline en español"
+        SpeechRecognizer.ERROR_AUDIO -> "fallo de audio"
+        12, 13 -> "idioma español no disponible en este dispositivo"
+        else -> "código $e"
+    }
+
+    private val listener = object : RecognitionListener {
+        override fun onPartialResults(p: Bundle?) {
+            val t = first(p)
+            if (t.isEmpty()) return
+            errors = 0
+            if (capturing) {
+                Controller.setPartial(t)
+                if (Normalizer.closes(t)) rec?.stopListening()        // palabra de cierre
+            } else if (wake == null && Normalizer.closes(t) &&
+                Normalizer.plain(t).contains(Normalizer.plain(Controller.state.value.keyword))) {
+                rec?.stopListening()
+            }
+        }
+
+        override fun onResults(r: Bundle?) {
+            errors = 0
+            val t = first(r)
+            if (capturing) { add(t); finish() }                       // pausa = fin del dictado
+            else if (wake == null && t.isNotEmpty()) waitingText(t)
+            if (active && needsRecognizer) listen()
+        }
+
+        override fun onError(e: Int) {
+            when (e) {
+                SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                    if (capturing) finish()
+                    if (active && needsRecognizer) listen()
+                }
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> { Controller.setPermissionDenied(true); stop() }
+                SpeechRecognizer.ERROR_RECOGNIZER_BUSY, SpeechRecognizer.ERROR_CLIENT -> {
+                    if (active && needsRecognizer) listen(400)
+                }
+                else -> {
+                    Controller.setError("Voz: ${describe(e)}")
+                    if (++errors > 5) { stop(); Controller.setError("Reconocimiento de voz no disponible: ${describe(e)}") }
+                    else if (active && needsRecognizer) listen(1500)
+                }
+            }
+        }
+
+        override fun onReadyForSpeech(p: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(v: Float) {}
+        override fun onBufferReceived(b: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onEvent(t: Int, p: Bundle?) {}
+    }
 }
