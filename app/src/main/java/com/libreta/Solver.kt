@@ -22,7 +22,6 @@ import kotlin.coroutines.resumeWithException
 class UnsolvableException(message: String) : Exception(message)
 
 object Solver {
-    private const val MODEL = "claude-sonnet-5-5"
     private val http = OkHttpClient.Builder().callTimeout(60, TimeUnit.SECONDS).build()
     private val TIPOS = setOf("datos", "planteo", "operacion", "procedimiento", "resultado", "otro")
 
@@ -79,17 +78,18 @@ No cambies lo que se copia. Responde SOLO JSON: {"aclaracion":"..."} (máximo 2 
 
     /** Llamada cancelable: si la corrutina se cancela, se cancela también la petición HTTP. */
     private suspend fun call(system: String, user: String): String = suspendCancellableCoroutine { cont ->
-        if (BuildConfig.ANTHROPIC_KEY.isBlank()) {
-            cont.resumeWithException(IOException("Falta ANTHROPIC_KEY en local.properties"))
+        val cfg = AiConfig.state.value
+        val problem = cfg.problem()
+        if (problem != null) {
+            cont.resumeWithException(IOException(problem))
             return@suspendCancellableCoroutine
         }
-        val body = JSONObject()
-            .put("model", MODEL).put("max_tokens", 1500).put("system", system)
-            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", user)))
-        val req = Request.Builder().url("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", BuildConfig.ANTHROPIC_KEY)   // MVP: en producción, proxy propio
-            .header("anthropic-version", "2023-06-01")
-            .post(body.toString().toRequestBody("application/json".toMediaType())).build()
+        val req = try {
+            buildRequest(cfg, system, user)
+        } catch (e: IllegalArgumentException) {
+            cont.resumeWithException(IOException("La URL del servicio no es válida."))
+            return@suspendCancellableCoroutine
+        }
         val c = http.newCall(req)
         cont.invokeOnCancellation { c.cancel() }
         c.enqueue(object : Callback {
@@ -102,7 +102,7 @@ No cambies lo que se copia. Responde SOLO JSON: {"aclaracion":"..."} (máximo 2 
             }
             override fun onResponse(call: Call, response: Response) {
                 try {
-                    val text = response.use { parse(it) }
+                    val text = response.use { parse(it, cfg.provider) }
                     if (cont.isActive) cont.resume(text)
                 } catch (e: Exception) {
                     if (cont.isActive) cont.resumeWithException(IOException(e.message ?: "Respuesta no válida"))
@@ -111,15 +111,55 @@ No cambies lo que se copia. Responde SOLO JSON: {"aclaracion":"..."} (máximo 2 
         })
     }
 
-    private fun parse(r: Response): String {
+    private fun buildRequest(c: AiSettings, system: String, user: String): Request {
+        val json = "application/json".toMediaType()
+        return if (c.provider == AiProvider.ANTHROPIC) {
+            val body = JSONObject()
+                .put("model", c.model).put("max_tokens", 1500).put("system", system)
+                .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", user)))
+            Request.Builder().url(c.endpoint())
+                .header("x-api-key", c.apiKey)   // MVP: en producción, proxy propio
+                .header("anthropic-version", "2023-06-01")
+                .post(body.toString().toRequestBody(json)).build()
+        } else {
+            val messages = JSONArray()
+                .put(JSONObject().put("role", "system").put("content", system))
+                .put(JSONObject().put("role", "user").put("content", user))
+            val body = JSONObject().put("model", c.model).put("messages", messages)
+            val b = Request.Builder().url(c.endpoint()).post(body.toString().toRequestBody(json))
+            if (c.apiKey.isNotBlank()) b.header("Authorization", "Bearer ${c.apiKey}")
+            b.build()
+        }
+    }
+
+    private fun errorDetail(txt: String): String = try {
+        val e = JSONObject(txt).opt("error")
+        val m = when (e) {
+            is JSONObject -> e.optString("message")
+            is String -> e
+            else -> ""
+        }
+        m.trim().take(160)
+    } catch (e: Exception) {
+        ""
+    }
+
+    private fun parse(r: Response, provider: AiProvider): String {
         val txt = r.body?.string().orEmpty()
-        if (!r.isSuccessful) throw IOException(
-            when (r.code) {
-                401 -> "Clave de API inválida."
+        if (!r.isSuccessful) {
+            val base = when (r.code) {
+                401, 403 -> "Clave de API inválida o sin permiso."
+                404 -> "Modelo o URL no encontrados (404)."
                 429 -> "Límite de peticiones alcanzado. Espera un momento."
                 else -> "Error del servicio (${r.code})."
             }
-        )
+            val detail = errorDetail(txt)
+            throw IOException(if (detail.isBlank()) base else "$base $detail")
+        }
+        return if (provider == AiProvider.ANTHROPIC) parseAnthropic(txt) else parseOpenAi(txt)
+    }
+
+    private fun parseAnthropic(txt: String): String {
         val content = JSONObject(txt).getJSONArray("content")
         val sb = StringBuilder()
         for (i in 0 until content.length()) {
@@ -127,5 +167,18 @@ No cambies lo que se copia. Responde SOLO JSON: {"aclaracion":"..."} (máximo 2 
             if (blk.optString("type") == "text") sb.append(blk.optString("text"))
         }
         return sb.toString()
+    }
+
+    private fun parseOpenAi(txt: String): String {
+        val msg = JSONObject(txt).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+        return when (val c = msg.opt("content")) {
+            is String -> c
+            is JSONArray -> {
+                val sb = StringBuilder()
+                for (i in 0 until c.length()) sb.append(c.optJSONObject(i)?.optString("text").orEmpty())
+                sb.toString()
+            }
+            else -> ""
+        }
     }
 }
