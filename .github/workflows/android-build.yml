@@ -26,6 +26,9 @@ jobs:
           echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
           echo "ANTHROPIC_KEY=${{ secrets.ANTHROPIC_KEY }}" >> local.properties
           echo "AI_API_KEY=${{ secrets.AI_API_KEY }}" >> local.properties
+          echo "AI_PROVIDER=${{ secrets.AI_PROVIDER }}" >> local.properties
+          echo "AI_BASE_URL=${{ secrets.AI_BASE_URL }}" >> local.properties
+          echo "AI_MODEL=${{ secrets.AI_MODEL }}" >> local.properties
           echo "PICOVOICE_KEY=${{ secrets.PICOVOICE_KEY }}" >> local.properties
           yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
@@ -59,5 +62,4 @@ jobs:
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          
+          if-no-files-found: error          
