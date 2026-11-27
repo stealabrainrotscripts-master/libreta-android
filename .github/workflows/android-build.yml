@@ -1,11 +1,63 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
       - name: Configurar Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Preparar entorno Android SDK
+      - name: Preparar entorno Android SDK y local.properties
         run: |
           echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          echo "ANTHROPIC_KEY=${{ secrets.ANTHROPIC_KEY }}" >> local.properties
+          echo "AI_API_KEY=${{ secrets.AI_API_KEY }}" >> local.properties
+          echo "PICOVOICE_KEY=${{ secrets.PICOVOICE_KEY }}" >> local.properties
+          yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Dar permiso de ejecución a gradlew (si existe)
+        run: |
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+          fi
+
+      - name: Ejecutar pruebas unitarias
+        run: |
+          if [ -f "./gradlew" ]; then
+            ./gradlew testDebugUnitTest
+          else
+            gradle testDebugUnitTest
+          fi
+
+      - name: Compilar APK de debug
+        run: |
+          if [ -f "./gradlew" ]; then
+            ./gradlew assembleDebug
+          else
+            gradle assembleDebug
+          fi
+
+      - name: Subir APK de debug
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
           
