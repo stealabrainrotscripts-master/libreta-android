@@ -23,7 +23,10 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "ANTHROPIC_KEY", buildConfigSecret("ANTHROPIC_KEY"))
         buildConfigField("String", "PICOVOICE_KEY", buildConfigSecret("PICOVOICE_KEY"))
-        buildConfigField("String", "ANTHROPIC_MODEL", buildConfigSecret("ANTHROPIC_MODEL").let { if (it == "\"\"") "\"claude-sonnet-4-5\"" else it })
+        buildConfigField("String", "AI_PROVIDER", buildConfigSecret("AI_PROVIDER"))
+        buildConfigField("String", "AI_BASE_URL", buildConfigSecret("AI_BASE_URL"))
+        buildConfigField("String", "AI_API_KEY", buildConfigSecret("AI_API_KEY"))
+        buildConfigField("String", "AI_MODEL", buildConfigSecret("AI_MODEL"))
     }
     buildFeatures { compose = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
