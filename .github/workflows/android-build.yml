@@ -41,17 +41,17 @@ jobs:
       - name: Ejecutar pruebas unitarias
         run: |
           if [ -f "./gradlew" ]; then
-            ./gradlew testDebugUnitTest
+            ./gradlew testDebugUnitTest --stacktrace
           else
-            gradle testDebugUnitTest
+            gradle testDebugUnitTest --stacktrace
           fi
 
       - name: Compilar APK de debug
         run: |
           if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug
+            ./gradlew assembleDebug --stacktrace
           else
-            gradle assembleDebug
+            gradle assembleDebug --stacktrace
           fi
 
       - name: Subir APK de debug
