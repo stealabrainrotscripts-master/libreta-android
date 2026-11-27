@@ -25,7 +25,17 @@ object Normalizer {
     fun closes(text:String)=close.containsMatchIn(text)
     fun base(raw:String)=raw.lowercase().replace(close,"").trim().trim(',', '.', '!', '?', ';', ':')
     fun plain(text:String)=JNormalizer.normalize(text.lowercase(),JNormalizer.Form.NFD).replace(Regex("\\p{Mn}+"),"").replace(Regex("[^\\p{L}\\d]+")," ").trim().replace(Regex("\\s+")," ")
-    fun dropLeadingKeyword(text:String,keyword:String):String { val normalized=plain(text);val kw=plain(keyword);if(kw.isEmpty()||!(normalized==kw||normalized.startsWith("$kw ")))return text;return normalized.removePrefix(kw).trim() }
-    fun symbols(base:String):String { var s=numbers(base.lowercase());for((p,v)in phrases)s=s.replace(phrase(p),v);s=operators(s);return s.replace(Regex("\\s*([/^])\\s*"),"$1").replace(Regex("([√∛])\\s+"),"$1").replace(Regex("\\s+([²³])"),"$1").replace(Regex("\\s+")," ").trim() }
+    fun dropLeadingKeyword(text:String,keyword:String):String {
+        val kw=plain(keyword)
+        if(kw.isEmpty())return text
+        val words=text.trim().split(Regex("\\s+"))
+        for(n in 1..words.size){
+            val head=plain(words.take(n).joinToString(" "))
+            if(head==kw)return words.drop(n).joinToString(" ")
+            if(head.length>kw.length)break
+        }
+        return text
+    }
+    fun symbols(base:String):String { var s=numbers(base.lowercase());for((p,v)in phrases)s=s.replace(phrase(p),v);s=operators(s);return s.replace(Regex("\\s*([/^])\\s*"),"$1").replace(Regex("([√∛])\\s+"),"$1").replace(Regex("\\s+([²³])"),"$1").replace(Regex("\\(\\s+"),"(").replace(Regex("\\s+\\)"),")").replace(Regex("\\s+")," ").trim() }
     fun command(t:String):VoiceCommand?=when(plain(t)){"siguiente","siguiente paso","sigue","adelante"->VoiceCommand.NEXT;"repítelo","repitelo","repite","repetir","repite el paso"->VoiceCommand.REPEAT;"más simple","mas simple","explícalo más simple","explicalo mas simple","más fácil","mas facil"->VoiceCommand.SIMPLER;"nuevo ejercicio","nuevo","borrar"->VoiceCommand.NEW;else->null}
 }
