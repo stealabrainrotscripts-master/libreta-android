@@ -28,12 +28,18 @@ class VoiceController(private val ctx: Context) {
     private var errors = 0
     private val buf = StringBuilder()
 
-    private val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+    // Si el dispositivo no soporta es-ES, se prueban otras variantes del español.
+    private val langs = listOf("es-ES", "es-419", "es-US", "es-MX", "es-VE", "es")
+    private var langIdx = 0
+
+    private fun buildIntent(lang: String) = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
         .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-        .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
+        .putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
         .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         .putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L)
+
+    private var intent = buildIntent(langs[0])
 
     private val listenRunnable = Runnable { if (active) { rec?.cancel(); rec?.startListening(intent) } }
     private val watchdog = Runnable { if (capturing) finish() }
@@ -44,7 +50,7 @@ class VoiceController(private val ctx: Context) {
         if (!SpeechRecognizer.isRecognitionAvailable(ctx)) {
             Controller.setError("Este dispositivo no tiene reconocimiento de voz"); return
         }
-        active = true; errors = 0
+        active = true; errors = 0; langIdx = 0; intent = buildIntent(langs[0])
         Controller.setError(null)
         rec = SpeechRecognizer.createSpeechRecognizer(ctx).also { it.setRecognitionListener(listener) }
         prepareWake()
@@ -151,8 +157,14 @@ class VoiceController(private val ctx: Context) {
         SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT, SpeechRecognizer.ERROR_SERVER ->
             "sin red: descarga el paquete de voz offline en español"
         SpeechRecognizer.ERROR_AUDIO -> "fallo de audio"
-        12, 13 -> "idioma español no disponible en este dispositivo"
+        12, 13 -> "idioma español no disponible: instala el paquete de español en Servicios de voz de Google"
         else -> "código $e"
+    }
+
+    private fun fail(e: Int) {
+        Controller.setError("Voz: ${describe(e)}")
+        if (++errors > 5) { stop(); Controller.setError("Reconocimiento de voz no disponible: ${describe(e)}") }
+        else if (active && needsRecognizer) listen(1500)
     }
 
     private val listener = object : RecognitionListener {
@@ -187,11 +199,13 @@ class VoiceController(private val ctx: Context) {
                 SpeechRecognizer.ERROR_RECOGNIZER_BUSY, SpeechRecognizer.ERROR_CLIENT -> {
                     if (active && needsRecognizer) listen(400)
                 }
-                else -> {
-                    Controller.setError("Voz: ${describe(e)}")
-                    if (++errors > 5) { stop(); Controller.setError("Reconocimiento de voz no disponible: ${describe(e)}") }
-                    else if (active && needsRecognizer) listen(1500)
+                12, 13 -> {
+                    if (langIdx < langs.lastIndex) {          // probar la siguiente variante del español
+                        langIdx++; intent = buildIntent(langs[langIdx])
+                        if (active && needsRecognizer) listen(300)
+                    } else fail(e)
                 }
+                else -> fail(e)
             }
         }
 
